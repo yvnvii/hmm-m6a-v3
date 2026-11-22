@@ -62,6 +62,13 @@ class Region:
     start: int       # 0-based inclusive
     end: int         # 0-based exclusive
     strand: str = "+"  # "+" or "-"
+    # Contig name in the BAM when it differs from `contig` (the reference
+    # FASTA / output name), e.g. GLORI-tools' "chr1_AG_converted".
+    bam_contig: Optional[str] = None
+
+    @property
+    def bam_name(self) -> str:
+        return self.bam_contig or self.contig
 
 
 @dataclass
@@ -162,7 +169,7 @@ def _poorly_converted_reads(
         return set()
     tgt = "A" if region.strand == "+" else "T"
     bad = set()
-    for aln in bam.fetch(region.contig, region.start, region.end):
+    for aln in bam.fetch(region.bam_name, region.start, region.end):
         if (aln.is_unmapped or aln.is_secondary or aln.is_supplementary
                 or aln.mapping_quality < min_mapq):
             continue
@@ -254,7 +261,7 @@ def _pileup_region(
     # GLORI-tools); truncate=True keeps columns inside [start, end). pysam
     # positions are 0-based genomic coordinates.
     for col in bam.pileup(
-        contig=region.contig,
+        contig=region.bam_name,
         start=region.start,
         stop=region.end,
         truncate=True,

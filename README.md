@@ -7,6 +7,7 @@ with the same three-stage cascade as GLORI-tools. Sites are then scored with
 the hmm-m6a per-nucleotide HMM instead of GLORI's binomial test. With
 `--glori-compat` the reads and per-site counts are exactly GLORI-tools', so
 only the calling method differs (see [Comparing with GLORI-tools](#comparing-with-glori-tools)).
+`run-bam` skips alignment and scores GLORI-tools' own BAM directly.
 `hmm.py`, `mle.py`, `train.py` and the `train` subcommand are unchanged
 from hmm-m6a.
 
@@ -171,6 +172,34 @@ BED name field: `m6A;gene=…;n=…;A=…;drach=…`; score = `round(1000·pM)`.
 Pass `--params` to skip training and score with existing parameters.
 `--threads` sets the thread count for STAR, bowtie, pileup and calling.
 
+### `run-bam`: start from a GLORI-tools BAM
+
+```bash
+hmm-m6a-fastq run-bam --bam GLORI_out/x_merged.sorted.bam --ref-dir /path/to/GLORI_ref \
+    --outdir out/x --threads 8
+```
+
+Skips alignment and runs regions → pileup → train (or `--params`) → call →
+gene labels on GLORI-tools' final BAM, writing the same files as `run`
+except the BAM: `x.regions.bed`, `x.pileup.tsv`, `x.params.json`,
+`x.calls.tsv`, `x.calls.bed`. The prefix defaults to the BAM name without
+`_merged.sorted.bam`; set it with `--prefix`.
+
+- **Counting rules**: `--glori-compat` is on by default (MAPQ 0,
+  base quality 10, `--max-unconverted 3` with whole-read A counts, ≥ 2 reads
+  per position), so the counts equal GLORI-tools' `3;` column. Explicit
+  options override it: `--max-unconverted -1` gives its overall
+  `AGcov`/`Acov`, and `--no-glori-compat` switches to the defaults of `pileup`.
+- **Contig names**: GLORI-tools' BAM keeps the converted-genome names
+  (`chr1_AG_converted`). The suffix is stripped to match `hg38.main.fa` and in
+  every output; the BAM is only read, never rewritten (an index is created
+  next to it if there is none). Change the suffix with `--contig-suffix`
+  (`''` = none). A `--bed` uses reference names (`chr1`).
+- **Spliced reads** from the transcriptome lift-over (`N` in the CIGAR)
+  count only on their exons, and split coverage regions at the intron.
+- Only `--genome` (`index/genome/*.main.fa`) and, optionally, `--baseanno`
+  are needed from the reference; `--ref-dir` finds both.
+
 ## Comparing with GLORI-tools
 
 To test the HMM against GLORI-tools' binomial test on identical input, pass
@@ -194,17 +223,28 @@ the command line overrides the compat default, so
 `--glori-compat --max-unconverted -1` gives GLORI-tools' reads with the
 read filter off (GLORI's unfiltered `AGcov`/`Acov` columns).
 
-To confirm that both pipelines saw the same data, run GLORI-tools and v3 on
-the same FASTQ and reference, then compare. The script exits 0 only if the
-reads and every per-site count agree:
+`run-bam` scores GLORI-tools' own BAM with these rules on by default, so
+both methods see the same reads without re-aligning.
+
+`tools/compare_glori.py` checks the counts. It compares the pileup's `n` and
+`A` at every strand-position with GLORI-tools' `<prefix>.totalformat.txt`,
+against both the overall `AGcov`/`Acov` columns and the `3;total,AG,A`
+column, and reports the number of mismatching positions with examples:
 
 ```bash
-python scripts/compare_glori.py \
-    --glori-format GLORI_out/x.totalformat.txt --v3-pileup out/x.pileup.tsv \
-    --glori-bam GLORI_out/x_merged.sorted.bam --v3-bam out/x.bam
-# v3 pileup made with --max-unconverted -1: compare against GLORI's unfiltered columns
-python scripts/compare_glori.py --acut all --glori-format ... --v3-pileup ...
+python tools/compare_glori.py --totalformat GLORI_out/x.totalformat.txt \
+    --pileup out/x/x.pileup.tsv
+# overall (AGcov, Acov): positions GLORI 1222  v3 1230  mismatching 1079  ...
+#     chr1:316(+)  GLORI(AG,A)=(5, 0)  v3(n,A)=(4, 0)
+# bin 3 (AG, A)     : positions GLORI 1222  v3 1230  mismatching 0  ...
+# expected match (bin): MATCH
 ```
+
+It exits 0 when the expected comparison matches: the `3;` column by
+default, `--expect overall` for a `--max-unconverted -1` pileup, or
+`--expect none` to only report. `--bin` picks another A-count column. For a
+v3 run that did its own alignment, `--glori-bam` with `--v3-bam` also
+compares the reads.
 
 GLORI's site filters (coverage ≥ 15, A ≥ 5, ratio ≥ 0.1, `var_ratio`,
 signal ratio, gene conversion rate) belong to its calling method and are
@@ -239,13 +279,13 @@ hmm-m6a-fastq/
 │   ├── align.py       STAR(AG) → STAR(rvsCom) → bowtie(transcriptome) cascade
 │   ├── annotation.py  tbl2 lift-over, noredundance.base gene labels
 │   ├── regions.py     coverage regions, parallel pileup/calling, training subset
-│   ├── cli.py         run / align / pileup / train / call / default-params
+│   ├── cli.py         run / run-bam / align / pileup / train / call / default-params
 │   ├── pileup.py      BAM + FASTA → per-A counts and DRACH   (from hmm-m6a)
 │   ├── calling.py     posterior thresholding                 (from hmm-m6a)
 │   ├── hmm.py         beta-binom PMF, FB, Viterbi, posterior  (unchanged)
 │   ├── mle.py         weighted MLE for (mu, kappa)            (unchanged)
 │   └── train.py       Baum-Welch with state-ordering constraint (unchanged)
 ├── example/           build_example.py (synthetic GLORI-tools layout), validate.py
-├── scripts/           compare_glori.py (reads/counts vs GLORI-tools)
+├── tools/             compare_glori.py (pileup counts vs GLORI-tools totalformat)
 └── tests/             test_hmm.py (from hmm-m6a), test_pipeline.py, test_compare_glori.py
 ```

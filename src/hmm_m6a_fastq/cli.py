@@ -11,6 +11,7 @@ Inputs (GLORI-tools layout; pass --ref-dir to find them automatically)
 
 Subcommands
     hmm-m6a-fastq run    --fastq full.clean.fq --ref-dir REF --outdir out/
+    hmm-m6a-fastq run-bam --bam GLORI/x_merged.sorted.bam --ref-dir REF --outdir out/
     hmm-m6a-fastq align  --fastq full.clean.fq --ref-dir REF -o sample.bam
     hmm-m6a-fastq pileup --bam sample.bam --ref-dir REF -o sample.pileup.tsv
     hmm-m6a-fastq train  --pileup sample.pileup.tsv -o params.json
@@ -34,14 +35,16 @@ from hmm_m6a_fastq import __version__
 from hmm_m6a_fastq.align import AlignOptions, GloriRefs, align_fastq
 from hmm_m6a_fastq.annotation import annotate_sites
 from hmm_m6a_fastq.hmm import HMMParams
-from hmm_m6a_fastq.pileup import Region, regions_from_bed
+from hmm_m6a_fastq.pileup import Region, _has_bai, regions_from_bed
 from hmm_m6a_fastq.regions import (
+    GLORI_CONTIG_SUFFIX,
     default_threads,
     parallel_call,
     parallel_pileup,
     regions_from_coverage,
     regions_to_bed,
     training_subset,
+    with_bam_contigs,
 )
 from hmm_m6a_fastq.train import TranscriptObs, baum_welch
 
@@ -160,15 +163,21 @@ def _pileup_filters(args) -> dict:
             for k, v in base.items()}
 
 
-def _do_pileup(args, bam: str, genome: str, regions_out: Optional[str] = None):
+def _do_pileup(args, bam: str, genome: str, regions_out: Optional[str] = None,
+               strip_suffix: Optional[str] = None):
+    """Regions -> per-A counts. `strip_suffix` is removed from the BAM's contig
+    names to match the genome FASTA and in all outputs (the BAM is only read)."""
     filt = _pileup_filters(args)
     _log(args, "[pileup] filters: " + ", ".join(f"{k}={v}" for k, v in filt.items())
          + (" (GLORI-tools compatible)" if args.glori_compat else ""))
     if args.bed:
         regions = regions_from_bed(args.bed)
+        if strip_suffix:
+            regions = with_bam_contigs(regions, bam, strip_suffix)
     else:
         regions = regions_from_coverage(
-            bam, min_reads=args.min_reads, max_gap=args.max_gap, min_mapq=filt["min_mapq"])
+            bam, min_reads=args.min_reads, max_gap=args.max_gap, min_mapq=filt["min_mapq"],
+            strip_suffix=strip_suffix)
     total = sum(r.end - r.start for r in regions)
     _log(args, f"[pileup] {len(regions)} regions, {total:,} nt")
     if regions_out:
@@ -267,8 +276,37 @@ def cmd_run(args) -> int:
     bam = f"{prefix}.bam"
     align_fastq(args.fastq, refs, bam, _align_options(args),
                 tmp_dir=args.tmp_dir, keep_tmp=args.keep_tmp, quiet=args.quiet)
+    return _score_bam(args, bam, refs.genome, refs.baseanno, prefix)
 
-    region_obs = _do_pileup(args, bam, refs.genome, f"{prefix}.regions.bed")
+
+def _bam_prefix(bam: str) -> str:
+    name = os.path.basename(bam)
+    for suffix in ("_merged.sorted.bam", ".sorted.bam", ".bam"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def cmd_run_bam(args) -> int:
+    """GLORI-tools BAM -> pileup -> [train] -> annotated calls (no alignment)."""
+    if not os.path.exists(args.bam):
+        raise SystemExit(f"no such BAM: {args.bam}")
+    if not _has_bai(args.bam):
+        import pysam
+        _log(args, f"[run-bam] indexing {args.bam}")
+        pysam.index(args.bam)
+    out = Path(args.outdir)
+    out.mkdir(parents=True, exist_ok=True)
+    prefix = str(out / (args.prefix or _bam_prefix(args.bam)))
+    return _score_bam(args, args.bam, _genome(args), _baseanno(args), prefix,
+                      strip_suffix=args.contig_suffix or None)
+
+
+def _score_bam(args, bam: str, genome: str, baseanno: Optional[str], prefix: str,
+               strip_suffix: Optional[str] = None) -> int:
+    """Shared tail of `run` and `run-bam`: regions, pileup, train/params, calls."""
+    region_obs = _do_pileup(args, bam, genome, f"{prefix}.regions.bed",
+                            strip_suffix=strip_suffix)
     _pileup_to_tsv(region_obs, f"{prefix}.pileup.tsv")
     if not region_obs:
         print("no region reached --min-reads; nothing to score.", file=sys.stderr)
@@ -282,7 +320,7 @@ def cmd_run(args) -> int:
         _write_params(f"{prefix}.params.json", params, history)
 
     _do_call(args, region_obs, params, f"{prefix}.calls.tsv", f"{prefix}.calls.bed",
-             refs.baseanno)
+             baseanno)
     return 0
 
 
@@ -396,6 +434,35 @@ def build_parser() -> argparse.ArgumentParser:
     sr.add_argument("--outdir", required=True)
     sr.add_argument("--prefix", default="sample", help="output file prefix")
     sr.set_defaults(func=cmd_run)
+
+    sb = sub.add_parser(
+        "run-bam", help="end-to-end from a GLORI-tools BAM (no alignment) -> annotated calls",
+        description="Start from GLORI-tools' <prefix>_merged.sorted.bam: regions -> pileup "
+                    "-> train (or --params) -> call -> gene labels, with the same outputs as "
+                    "`run`. GLORI-tools' counting rules (--glori-compat) are on by default; "
+                    "explicit filter options still override them.")
+    sb.add_argument("--bam", required=True,
+                    help="GLORI-tools <prefix>_merged.sorted.bam (indexed if no .bai)")
+    _add_ref_dir(sb)
+    sb.add_argument("--genome", help="index/genome/hg38.main.fa (unconverted, with .fai)")
+    sb.add_argument("--baseanno", help="anno/..._change2Ens.tbl2.noredundance.base (optional)")
+    sb.add_argument("--contig-suffix", default=GLORI_CONTIG_SUFFIX,
+                    help=f"suffix stripped from BAM contig names to match the genome and in "
+                         f"all outputs (default {GLORI_CONTIG_SUFFIX}; '' = none)")
+    _add_pileup_args(sb)
+    sb.add_argument("--glori-compat", action=argparse.BooleanOptionalAction, default=True,
+                    help="GLORI-tools' counting rules: whole-read A count, >= 2 reads per "
+                         "position, mapq 0 / baseq 10 / max-unconverted 3 (default on)")
+    _add_train_args(sb)
+    _add_call_args(sb)
+    _add_threads(sb)
+    sb.add_argument("--params", default=None,
+                    help="JSON of pretrained parameters; skips training if given")
+    sb.add_argument("--outdir", required=True)
+    sb.add_argument("--prefix", default=None,
+                    help="output file prefix (default: the BAM name without "
+                         "_merged.sorted.bam)")
+    sb.set_defaults(func=cmd_run_bam)
 
     sa = sub.add_parser("align", help="clean FASTQ -> genome BAM (STAR, STAR, bowtie)")
     _add_align_args(sa)

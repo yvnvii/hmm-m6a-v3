@@ -258,3 +258,97 @@ def test_two_stage_train_then_call(dataset: Path, tmp_path: Path):
                  "--ref-dir", ref, "-o", str(calls), "--threads", "1"]) == 0
     got = _called(calls)
     assert len(_truth(dataset) & set(zip(got["contig"], got["pos0"]))) >= 30
+
+
+# ---------------------------------------------------------------------------
+# run-bam: start from a GLORI-tools BAM
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("argv, expect", [
+    ([], {"min_mapq": 0, "min_baseq": 10, "max_unconverted": 3}),
+    (["--max-unconverted", "-1"], {"min_mapq": 0, "min_baseq": 10, "max_unconverted": -1}),
+    (["--min-mapq", "20"], {"min_mapq": 20, "min_baseq": 10, "max_unconverted": 3}),
+    (["--no-glori-compat"], {"min_mapq": 20, "min_baseq": 20, "max_unconverted": -1}),
+])
+def test_run_bam_filter_defaults(argv, expect):
+    """run-bam uses GLORI-tools' counting rules unless told otherwise."""
+    from hmm_m6a_fastq.cli import _pileup_filters, build_parser
+    args = build_parser().parse_args(["run-bam", "--bam", "x.bam", "--genome", "g.fa",
+                                      "--outdir", "o", *argv])
+    assert args.glori_compat == ("--no-glori-compat" not in argv)
+    assert _pileup_filters(args) == expect
+
+
+def _glori_like_bam(tmp_path: Path, contig: str):
+    """Reference 'c' with A's at 5, 15, 35; a BAM on contig `contig` holding
+    3 unspliced reads over [0, 20) and 3 spliced reads 10M20N10M over
+    [0, 10) + [30, 40). Only read 0 and read 3 keep their A's."""
+    ref = list(("GCTCGTCGCT" * 6))
+    for i in (5, 15, 35):
+        ref[i] = "A"
+    ref = "".join(ref)
+    conv = ref.replace("A", "G")
+    fa = tmp_path / "genome.main.fa"
+    if not fa.exists():
+        fa.write_text(">c\n" + ref + "\n")
+        pysam.faidx(str(fa))
+    hdr = {"HD": {"VN": "1.6", "SO": "coordinate"}, "SQ": [{"SN": contig, "LN": len(ref)}]}
+    bam = tmp_path / f"{contig}_merged.sorted.bam"
+    reads = [(ref[:20], [(0, 20)]), (conv[:20], [(0, 20)]), (conv[:20], [(0, 20)]),
+             (ref[:10] + ref[30:40], [(0, 10), (3, 20), (0, 10)]),
+             (conv[:10] + conv[30:40], [(0, 10), (3, 20), (0, 10)]),
+             (conv[:10] + conv[30:40], [(0, 10), (3, 20), (0, 10)])]
+    with pysam.AlignmentFile(str(bam), "wb", header=hdr) as out:
+        for k, (seq, cigar) in enumerate(reads):
+            a = pysam.AlignedSegment(out.header)
+            a.query_name = f"r{k}"; a.flag = 0; a.reference_id = 0
+            a.reference_start = 0; a.mapping_quality = 255; a.cigartuples = cigar
+            a.query_sequence = seq; a.query_qualities = pysam.qualitystring_to_array("I" * 20)
+            out.write(a)
+    pysam.index(str(bam))
+    return bam, fa
+
+
+def _site_counts(tsv: Path) -> dict:
+    df = pd.read_csv(tsv, sep="\t", dtype={"contig": str})
+    return {(r.contig, r.region_start + r.pos0_in_region): (r.n, r.A)
+            for r in df.itertuples()}
+
+
+def test_run_bam_glori_contigs_and_spliced_reads(tmp_path: Path):
+    """run-bam reads a BAM whose contigs end in _AG_converted, matches them to
+    the genome without the suffix, writes stripped names everywhere, counts
+    spliced reads only on their exons, and gives the same counts as `pileup
+    --glori-compat` on the same reads under plain contig names."""
+    bam, fa = _glori_like_bam(tmp_path, "c_AG_converted")
+    params = tmp_path / "p.json"
+    assert main(["-q", "default-params", "-o", str(params)]) == 0
+    out = tmp_path / "out"
+    assert main(["-q", "run-bam", "--bam", str(bam), "--genome", str(fa),
+                 "--outdir", str(out), "--min-reads", "1", "--n-min", "1",
+                 "--params", str(params), "--threads", "1"]) == 0
+    prefix = out / "c_AG_converted"          # <prefix>_merged.sorted.bam -> <prefix>
+    for ext in ("regions.bed", "pileup.tsv", "calls.tsv", "calls.bed"):
+        assert (Path(f"{prefix}.{ext}")).exists(), ext
+    assert Path(f"{prefix}.regions.bed").read_text().split("\t")[:3] == ["c", "0", "40"]
+    calls = pd.read_csv(f"{prefix}.calls.tsv", sep="\t", dtype={"contig": str})
+    assert set(calls["contig"]) == {"c"}
+
+    got = _site_counts(Path(f"{prefix}.pileup.tsv"))
+    # pos 5: all 6 reads (A in reads 0 and 3); pos 15: intron of the spliced
+    # reads, so unspliced reads only; pos 35: spliced reads only.
+    assert got == {("c", 5): (6, 2), ("c", 15): (3, 1), ("c", 35): (3, 1)}
+
+    plain, _ = _glori_like_bam(tmp_path, "c")
+    tsv = tmp_path / "plain.tsv"
+    assert main(["-q", "pileup", "--bam", str(plain), "--genome", str(fa), "--glori-compat",
+                 "--min-reads", "1", "--threads", "1", "-o", str(tsv)]) == 0
+    assert _site_counts(tsv) == got
+
+    # a regions BED in reference names is pointed at the suffixed BAM contigs
+    bed = tmp_path / "r.bed"
+    bed.write_text("c\t0\t40\tR\t0\t+\n")
+    out2 = tmp_path / "out2"
+    assert main(["-q", "run-bam", "--bam", str(bam), "--genome", str(fa), "--bed", str(bed),
+                 "--outdir", str(out2), "--prefix", "s", "--n-min", "1",
+                 "--params", str(params), "--threads", "1"]) == 0
+    assert _site_counts(out2 / "s.pileup.tsv") == got

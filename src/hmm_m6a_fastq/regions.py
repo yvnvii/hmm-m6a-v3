@@ -25,6 +25,29 @@ from hmm_m6a_fastq.pileup import Region, pileup_bam
 from hmm_m6a_fastq.train import TranscriptObs
 
 LIBRARY = "single-forward"   # GLORI reads are the RNA sense strand
+# GLORI-tools' merged BAM keeps the converted-genome contig names.
+GLORI_CONTIG_SUFFIX = "_AG_converted"
+
+
+def strip_contig(name: str, suffix: Optional[str]) -> str:
+    """`name` without a trailing `suffix` (the reference FASTA / output name)."""
+    if suffix and name.endswith(suffix):
+        return name[: -len(suffix)]
+    return name
+
+
+def with_bam_contigs(
+    regions: Sequence[Region], bam_path: str, suffix: Optional[str]
+) -> List[Region]:
+    """Point regions named by reference contig (e.g. from a BED) at the BAM's
+    contig names, for a BAM whose names carry `suffix`."""
+    with pysam.AlignmentFile(bam_path, "rb") as bam:
+        to_bam = {strip_contig(c, suffix): c for c in bam.references}
+    return [Region(name=r.name, contig=r.contig, start=r.start, end=r.end,
+                   strand=r.strand,
+                   bam_contig=None if to_bam.get(r.contig, r.contig) == r.contig
+                   else to_bam[r.contig])
+            for r in regions]
 
 
 def _merge(starts: np.ndarray, ends: np.ndarray, max_gap: int):
@@ -45,13 +68,19 @@ def regions_from_coverage(
     min_reads: int = 10,
     max_gap: int = 50,
     min_mapq: int = 20,
+    strip_suffix: Optional[str] = None,
 ) -> List[Region]:
-    """Strand-specific read clusters, one Region (HMM chain) each."""
+    """Strand-specific read clusters, one Region (HMM chain) each.
+
+    With `strip_suffix`, region contigs (and names) drop that suffix from the
+    BAM's contig names; `Region.bam_contig` keeps the BAM name for reading.
+    """
     out: List[Region] = []
     with pysam.AlignmentFile(bam_path, "rb") as bam:
-        for contig in bam.references:
+        for bam_contig in bam.references:
+            contig = strip_contig(bam_contig, strip_suffix)
             blocks = {"+": ([], []), "-": ([], [])}
-            for aln in bam.fetch(contig):
+            for aln in bam.fetch(bam_contig):
                 if (aln.is_unmapped or aln.is_secondary or aln.is_supplementary
                         or aln.mapping_quality < min_mapq):
                     continue
@@ -68,7 +97,8 @@ def regions_from_coverage(
                     if k >= min_reads:
                         out.append(Region(
                             name=f"{contig}:{s + 1}-{e}({strand})",
-                            contig=contig, start=int(s), end=int(e), strand=strand))
+                            contig=contig, start=int(s), end=int(e), strand=strand,
+                            bam_contig=None if bam_contig == contig else bam_contig))
     return out
 
 
