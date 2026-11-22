@@ -231,4 +231,30 @@ def test_bam_bases_match_genome(dataset: Path, tmp_path: Path):
     assert main(["-q", "align", "--fastq", str(dataset / "full.clean.fq"),
                  "--ref-dir", str(dataset / "ref"), "-o", str(bam), "--threads", "2"]) == 0
     fa = pysam.FastaFile(str(dataset / "ref/index/genome/syn.main.fa"))
- 
+    checked = bad = 0
+    with pysam.AlignmentFile(str(bam)) as fh:
+        for r in fh:
+            ref = fa.fetch(r.reference_name, r.reference_start, r.reference_end)
+            tgt, conv = ("T", "C") if r.is_reverse else ("A", "G")
+            for qp, rp in r.get_aligned_pairs(matches_only=True):
+                rb, qb = ref[rp - r.reference_start], r.query_sequence[qp]
+                checked += 1
+                ok = qb in (tgt, conv) if rb == tgt else qb == rb
+                bad += not ok
+    # error-free simulation: only STAR's junction-edge placements may disagree
+    assert checked > 100_000 and bad <= 10
+
+
+@needs_tools
+def test_two_stage_train_then_call(dataset: Path, tmp_path: Path):
+    ref = str(dataset / "ref")
+    bam, pile = tmp_path / "s.bam", tmp_path / "s.pileup.tsv"
+    params, calls = tmp_path / "p.json", tmp_path / "c.tsv"
+    assert main(["-q", "align", "--fastq", str(dataset / "full.clean.fq"),
+                 "--ref-dir", ref, "-o", str(bam)]) == 0
+    assert main(["-q", "pileup", "--bam", str(bam), "--ref-dir", ref, "-o", str(pile)]) == 0
+    assert main(["-q", "train", "--pileup", str(pile), "-o", str(params)]) == 0
+    assert main(["-q", "call", "--pileup", str(pile), "--params", str(params),
+                 "--ref-dir", ref, "-o", str(calls), "--threads", "1"]) == 0
+    got = _called(calls)
+    assert len(_truth(dataset) & set(zip(got["contig"], got["pos0"]))) >= 30

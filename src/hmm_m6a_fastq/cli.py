@@ -416,4 +416,36 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("-o", "--output", required=True, help="output TSV path")
     sp.set_defaults(func=cmd_pileup)
 
-    st = sub.add_parser("train", help="
+    st = sub.add_parser("train", help="pileup TSV -> Baum-Welch JSON parameters")
+    st.add_argument("--pileup", required=True)
+    _add_train_args(st)
+    st.add_argument("-o", "--output", required=True, help="output JSON path")
+    st.set_defaults(func=cmd_train)
+
+    sc = sub.add_parser("call", help="pileup TSV + params -> annotated per-site calls")
+    sc.add_argument("--pileup", required=True)
+    sc.add_argument("--params", required=True)
+    _add_ref_dir(sc)
+    sc.add_argument("--baseanno", help="anno/...tbl2.noredundance.base (optional)")
+    _add_call_args(sc)
+    _add_threads(sc)
+    sc.add_argument("-o", "--output", required=True, help="output TSV path")
+    sc.add_argument("--bed-out", default=None, help="optional BED6 of called sites")
+    sc.set_defaults(func=cmd_call)
+
+    sd = sub.add_parser("default-params", help="write default (untrained) parameters to JSON")
+    sd.add_argument("--states", type=int, default=3, choices=[3, 4])
+    sd.add_argument("-o", "--output", required=True, help="output JSON path")
+    sd.set_defaults(func=cmd_default_params)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

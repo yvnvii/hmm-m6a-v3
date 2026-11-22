@@ -194,6 +194,18 @@ the command line overrides the compat default, so
 `--glori-compat --max-unconverted -1` gives GLORI-tools' reads with the
 read filter off (GLORI's unfiltered `AGcov`/`Acov` columns).
 
+To confirm that both pipelines saw the same data, run GLORI-tools and v3 on
+the same FASTQ and reference, then compare. The script exits 0 only if the
+reads and every per-site count agree:
+
+```bash
+python scripts/compare_glori.py \
+    --glori-format GLORI_out/x.totalformat.txt --v3-pileup out/x.pileup.tsv \
+    --glori-bam GLORI_out/x_merged.sorted.bam --v3-bam out/x.bam
+# v3 pileup made with --max-unconverted -1: compare against GLORI's unfiltered columns
+python scripts/compare_glori.py --acut all --glori-format ... --v3-pileup ...
+```
+
 GLORI's site filters (coverage ≥ 15, A ≥ 5, ratio ≥ 0.1, `var_ratio`,
 signal ratio, gene conversion rate) belong to its calling method and are
 not applied. `--n-min 15` restricts the HMM to GLORI's coverage cutoff.
@@ -234,5 +246,6 @@ hmm-m6a-fastq/
 │   ├── mle.py         weighted MLE for (mu, kappa)            (unchanged)
 │   └── train.py       Baum-Welch with state-ordering constraint (unchanged)
 ├── example/           build_example.py (synthetic GLORI-tools layout), validate.py
-└── tests/             test_hmm.py (from hmm-m6a), test_pipeline.py
+├── scripts/           compare_glori.py (reads/counts vs GLORI-tools)
+└── tests/             test_hmm.py (from hmm-m6a), test_pipeline.py, test_compare_glori.py
 ```
