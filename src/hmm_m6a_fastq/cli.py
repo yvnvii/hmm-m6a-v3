@@ -144,23 +144,38 @@ def _refs(args) -> GloriRefs:
 def _align_options(args) -> AlignOptions:
     return AlignOptions(
         threads=args.threads, mismatches=args.mismatches, min_frac=args.min_frac,
-        star_extra=args.star_args.split(), bowtie_extra=args.bowtie_args.split())
+        star_extra=args.star_args.split(), bowtie_extra=args.bowtie_args.split(),
+        glori_compat=args.glori_compat)
+
+
+# Pileup filter defaults: the method's own, and GLORI-tools' (--glori-compat).
+# A value given on the command line always wins over either.
+PILEUP_DEFAULTS = {"min_mapq": 20, "min_baseq": 20, "max_unconverted": -1}
+GLORI_PILEUP_DEFAULTS = {"min_mapq": 0, "min_baseq": 10, "max_unconverted": 3}
+
+
+def _pileup_filters(args) -> dict:
+    base = GLORI_PILEUP_DEFAULTS if args.glori_compat else PILEUP_DEFAULTS
+    return {k: (getattr(args, k) if getattr(args, k) is not None else v)
+            for k, v in base.items()}
 
 
 def _do_pileup(args, bam: str, genome: str, regions_out: Optional[str] = None):
+    filt = _pileup_filters(args)
+    _log(args, "[pileup] filters: " + ", ".join(f"{k}={v}" for k, v in filt.items())
+         + (" (GLORI-tools compatible)" if args.glori_compat else ""))
     if args.bed:
         regions = regions_from_bed(args.bed)
     else:
         regions = regions_from_coverage(
-            bam, min_reads=args.min_reads, max_gap=args.max_gap, min_mapq=args.min_mapq)
+            bam, min_reads=args.min_reads, max_gap=args.max_gap, min_mapq=filt["min_mapq"])
     total = sum(r.end - r.start for r in regions)
     _log(args, f"[pileup] {len(regions)} regions, {total:,} nt")
     if regions_out:
         regions_to_bed(regions, regions_out)
     return parallel_pileup(
         bam, genome, regions, threads=args.threads,
-        min_mapq=args.min_mapq, min_baseq=args.min_baseq,
-        max_unconverted=args.max_unconverted)
+        glori_compat=args.glori_compat, **filt)
 
 
 def _do_train(args, region_obs):
@@ -318,11 +333,22 @@ def _add_pileup_args(p) -> None:
                    help="drop coverage regions with fewer reads (default 10)")
     g.add_argument("--max-gap", type=int, default=50,
                    help="merge reads closer than this into one region (default 50 nt)")
-    g.add_argument("--min-mapq", type=int, default=20)
-    g.add_argument("--min-baseq", type=int, default=20)
-    g.add_argument("--max-unconverted", type=int, default=-1,
-                   help="GLORI read filter: drop reads with more than this many "
-                        "unconverted A's (GLORI-tools uses 3; default -1 = keep all)")
+    g.add_argument("--min-mapq", type=int, default=None,
+                   help="minimum MAPQ (default 20; --glori-compat: 0)")
+    g.add_argument("--min-baseq", type=int, default=None,
+                   help="minimum base quality at the site (default 20; --glori-compat: 10)")
+    g.add_argument("--max-unconverted", type=int, default=None,
+                   help="drop reads with more than this many unconverted A's; -1 = off "
+                        "(default -1; --glori-compat: 3, counting every A in the read)")
+
+
+def _add_compat_arg(p) -> None:
+    p.add_argument("--glori-compat", action="store_true",
+                   help="reproduce GLORI-tools' reads and per-site counts exactly, for a "
+                        "like-for-like comparison with its binomial test: its alignment "
+                        "strand rules and base restoration (including its bug on rvsCom "
+                        "forward hits), whole-read A counting, the >= 2 reads rule, and "
+                        "its filter values. Use it for both `align` and `pileup`.")
 
 
 def _add_train_args(p) -> None:
@@ -361,6 +387,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_align_args(sr)
     _add_ref_args(sr)
     _add_pileup_args(sr)
+    _add_compat_arg(sr)
     _add_train_args(sr)
     _add_call_args(sr)
     _add_threads(sr)
@@ -373,6 +400,7 @@ def build_parser() -> argparse.ArgumentParser:
     sa = sub.add_parser("align", help="clean FASTQ -> genome BAM (STAR, STAR, bowtie)")
     _add_align_args(sa)
     _add_ref_args(sa)
+    _add_compat_arg(sa)
     _add_threads(sa)
     sa.add_argument("-o", "--output", required=True, help="output BAM path")
     sa.set_defaults(func=cmd_align)
@@ -382,41 +410,10 @@ def build_parser() -> argparse.ArgumentParser:
     _add_ref_dir(sp)
     sp.add_argument("--genome", help="index/genome/hg38.main.fa")
     _add_pileup_args(sp)
+    _add_compat_arg(sp)
     _add_threads(sp)
     sp.add_argument("--regions-out", default=None, help="also write the regions as BED6")
     sp.add_argument("-o", "--output", required=True, help="output TSV path")
     sp.set_defaults(func=cmd_pileup)
 
-    st = sub.add_parser("train", help="pileup TSV -> Baum-Welch JSON parameters")
-    st.add_argument("--pileup", required=True)
-    _add_train_args(st)
-    st.add_argument("-o", "--output", required=True, help="output JSON path")
-    st.set_defaults(func=cmd_train)
-
-    sc = sub.add_parser("call", help="pileup TSV + params -> annotated per-site calls")
-    sc.add_argument("--pileup", required=True)
-    sc.add_argument("--params", required=True)
-    _add_ref_dir(sc)
-    sc.add_argument("--baseanno", help="anno/...tbl2.noredundance.base (optional)")
-    _add_call_args(sc)
-    _add_threads(sc)
-    sc.add_argument("-o", "--output", required=True, help="output TSV path")
-    sc.add_argument("--bed-out", default=None, help="optional BED6 of called sites")
-    sc.set_defaults(func=cmd_call)
-
-    sd = sub.add_parser("default-params", help="write default (untrained) parameters to JSON")
-    sd.add_argument("--states", type=int, default=3, choices=[3, 4])
-    sd.add_argument("-o", "--output", required=True, help="output JSON path")
-    sd.set_defaults(func=cmd_default_params)
-
-    return p
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    return args.func(args)
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    st = sub.add_parser("train", help="

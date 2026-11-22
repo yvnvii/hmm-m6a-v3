@@ -4,7 +4,9 @@ hmm-m6a for **clean GLORI-seq FASTQ** input, using the **GLORI-tools
 reference files** (converted genomes with STAR indices, a bowtie
 transcriptome index, and the GLORI annotation tables). Reads are aligned
 with the same three-stage cascade as GLORI-tools. Sites are then scored with
-the hmm-m6a per-nucleotide HMM instead of GLORI's binomial test.
+the hmm-m6a per-nucleotide HMM instead of GLORI's binomial test. With
+`--glori-compat` the reads and per-site counts are exactly GLORI-tools', so
+only the calling method differs (see [Comparing with GLORI-tools](#comparing-with-glori-tools)).
 `hmm.py`, `mle.py`, `train.py` and the `train` subcommand are unchanged
 from hmm-m6a.
 
@@ -100,11 +102,11 @@ Alignment settings match GLORI-tools: up to 2 mismatches,
 `--outFilterScoreMinOverLread 0.5`, `--outFilterMatchNminOverLread 0.5`,
 unique hits only (STAR `--outFilterMultimapNmax 1`, bowtie `-m 1`).
 
-One difference: GLORI-tools throws away reads that hit the wrong strand of
-the AG genome. Here they are passed on to the next stage instead.
+A read that hits the wrong strand at one stage is tried at the next.
+GLORI-tools differs here; `--glori-compat` follows it instead (see below).
 
 `stats.json` reports reads kept at each stage, plus unaligned and
-unliftable reads.
+unliftable reads (and, with `--glori-compat`, dropped wrong-strand reads).
 
 ### 2. `pileup`: BAM → per-adenosine counts
 
@@ -121,9 +123,12 @@ unliftable reads.
 - **Counting.** For every reference A on the region's strand (looked up
   in `hg38.main.fa`), the tool counts reads showing A and reads showing G,
   and flags A's in a DRACH motif.
-- **Filters:** `--min-mapq`, `--min-baseq` and `--max-unconverted N`.
-  `--max-unconverted` drops reads with more than N unconverted A's
-  (GLORI-tools uses 3; off by default).
+- **Filters:** `--min-mapq` (20), `--min-baseq` (20) and
+  `--max-unconverted N` (default `-1`, off). `--max-unconverted` drops reads
+  with more than N unconverted A's, counted at aligned positions where the
+  reference is A and the base passes `--min-baseq`. Columns are read to a
+  depth of 10,000,000 (10,000 on `GL…` contigs), as in GLORI-tools; pysam's
+  default of 8,000 would silently drop reads at deep loci.
 
 ### 3. `train`: Baum-Welch (unchanged from hmm-m6a)
 
@@ -165,6 +170,33 @@ BED name field: `m6A;gene=…;n=…;A=…;drach=…`; score = `round(1000·pM)`.
 
 Pass `--params` to skip training and score with existing parameters.
 `--threads` sets the thread count for STAR, bowtie, pileup and calling.
+
+## Comparing with GLORI-tools
+
+To test the HMM against GLORI-tools' binomial test on identical input, pass
+`--glori-compat` to `run`, or to both `align` and `pileup`. The reads in the
+BAM and the per-site `n` and `A` are then exactly the `AGcov` and `Acov` that
+GLORI-tools' caller tests at its default `--cutoff 3`:
+
+| | default | `--glori-compat` (GLORI-tools source) |
+|---|---|---|
+| stage-1 / stage-3 reverse hits | tried at the next stage | dropped (`mapping_reads.py`, `samtools -F 20`) |
+| stage-2 forward hits | tried at the next stage | kept, with GLORI-tools' base restoration, which writes T at mirrored positions instead of A (`reverseReads2`) |
+| `--min-mapq` | 20 | 0 (no MAPQ filter) |
+| `--min-baseq` | 20 | 10 (`pileup_genome_multiprocessing.py -q`) |
+| `--max-unconverted` | -1 (off) | 3 (`m6A_caller.py --cutoff 3`) |
+| how A's per read are counted | aligned reference A's that pass `--min-baseq` | every A in the read, soft clips and mismatches included |
+| positions seen by < 2 reads | kept | n = 0 (`get_referbase.py`) |
+
+The stage-2 restoration is a GLORI-tools bug, reproduced only so that both
+pipelines count the same bases; keep it out of normal runs. A value given on
+the command line overrides the compat default, so
+`--glori-compat --max-unconverted -1` gives GLORI-tools' reads with the
+read filter off (GLORI's unfiltered `AGcov`/`Acov` columns).
+
+GLORI's site filters (coverage ≥ 15, A ≥ 5, ratio ≥ 0.1, `var_ratio`,
+signal ratio, gene conversion rate) belong to its calling method and are
+not applied. `--n-min 15` restricts the HMM to GLORI's coverage cutoff.
 
 ## Several samples: train once, call many
 

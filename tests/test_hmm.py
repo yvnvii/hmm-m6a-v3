@@ -218,8 +218,66 @@ def test_read_filter_drops_poorly_converted_reads(tmp_path):
             out.write(a)
     pysam.index(str(bam))
     reg = [Region("r", "c", 0, len(ref), "+")]
-    (_, tr), = pileup_bam(str(bam), str(fa), reg, show_progress=False, library="single-forward")
+    (_, tr), = pileup_bam(str(bam), str(fa), reg, show_progress=False,
+                          library="single-forward", max_unconverted=-1)
     assert tr.n[tr.A_idx].min() == 20 and tr.A_count[tr.A_idx].min() == 5
     (_, tf), = pileup_bam(str(bam), str(fa), reg, show_progress=False,
                           library="single-forward", max_unconverted=2)
     assert tf.n[tf.A_idx].min() == 15 and tf.A_count[tf.A_idx].sum() == 0
+
+
+def _write_bam(tmp_path, ref, reads):
+    """reads: list of (seq, quals, cigar, reverse)."""
+    import pysam
+    fa = tmp_path / "r.fa"; fa.write_text(">c\n" + ref + "\n"); pysam.faidx(str(fa))
+    hdr = {"HD": {"VN": "1.6", "SO": "coordinate"}, "SQ": [{"SN": "c", "LN": len(ref)}]}
+    bam = tmp_path / "r.bam"
+    with pysam.AlignmentFile(str(bam), "wb", header=hdr) as out:
+        for k, (seq, quals, cigar, rev) in enumerate(reads):
+            a = pysam.AlignedSegment(out.header)
+            a.query_name = f"r{k}"; a.flag = 16 if rev else 0
+            a.reference_id = 0; a.reference_start = 0
+            a.mapping_quality = 255; a.cigartuples = cigar
+            a.query_sequence = seq; a.query_qualities = quals
+            out.write(a)
+    pysam.index(str(bam))
+    return str(bam), str(fa)
+
+
+def test_glori_compat_read_and_site_filters(tmp_path):
+    """glori_compat reproduces GLORI-tools: A's are counted over the whole
+    read (soft clip included) and a position seen by fewer than 2 reads gets
+    n = 0. The default mode does neither."""
+    from hmm_m6a_fastq.pileup import Region, pileup_bam
+
+    ref = "GCGTGACTCG"                      # one A, at index 5
+    conv = ref.replace("A", "G")
+    clip = "AAAA"                           # 4 A's, all soft-clipped
+    reads = [
+        (conv, [40] * 10, [(0, 10)], False),                   # G
+        (ref, [40] * 10, [(0, 10)], False),                    # A (1 A in read)
+        (ref, [40] * 5 + [9] + [40] * 4, [(0, 10)], False),    # Q9 at the site: skipped
+        (conv + clip, [40] * 14, [(0, 10), (4, 4)], False),    # G; 4 A's in the clip
+    ]
+    bam, fa = _write_bam(tmp_path, ref, reads)
+    reg = [Region("r", "c", 0, len(ref), "+")]
+    glori = dict(show_progress=False, library="single-forward", glori_compat=True,
+                 min_mapq=0, min_baseq=10)
+
+    def site(b, f, **kw):
+        (_, tr), = pileup_bam(b, f, reg, **kw)
+        return int(tr.n[5]), int(tr.A_count[5])
+
+    # GLORI: the clipped read has 4 A's > 3 -> dropped
+    assert site(bam, fa, max_unconverted=3, **glori) == (2, 1)
+    # -1 turns the filter off, also in compat mode
+    assert site(bam, fa, max_unconverted=-1, **glori) == (3, 1)
+    # default mode counts only aligned reference A's, so the clip does not count
+    assert site(bam, fa, show_progress=False, library="single-forward",
+                max_unconverted=3) == (3, 1)
+
+    # only one read passes base quality at the site
+    sub = tmp_path / "one"; sub.mkdir()
+    bam1, fa1 = _write_bam(sub, ref, [reads[1], reads[2]])
+    assert site(bam1, fa1, max_unconverted=3, **glori) == (0, 0)       # GLORI drops it
+    assert site(bam1, fa1, show_progress=False, library="single-forward") == (1, 1)

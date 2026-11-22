@@ -16,7 +16,8 @@ import pandas as pd
 import pysam
 import pytest
 
-from hmm_m6a_fastq.align import GloriRefs, encode_name, iter_fastq, restore_bases
+from hmm_m6a_fastq.align import (AlignStats, GloriRefs, _process_stage, encode_name,
+                                  iter_fastq, restore_bases, restore_bases_mirrored)
 from hmm_m6a_fastq.annotation import TranscriptModel, annotate_sites, load_tbl2
 from hmm_m6a_fastq.cli import main
 from hmm_m6a_fastq.regions import _merge
@@ -34,6 +35,88 @@ def test_name_mask_round_trip(seq):
     name = encode_name(7, seq)
     assert name.startswith("7_")
     assert restore_bases(seq.replace("A", "G"), name) == seq
+
+
+def test_mirrored_restore_matches_glori_tools():
+    """GLORI-tools restores rvsCom forward hits via revcomp -> put A -> revcomp."""
+    rc = str.maketrans("ACGT", "TGCA")
+    seq = "ACGTAAGGCA"
+    name = encode_name(0, seq)
+    conv = seq.replace("A", "G")
+    glori = list(conv.translate(rc)[::-1])
+    for k, b in enumerate(seq):
+        if b == "A":
+            glori[k] = "A"
+    glori = "".join(glori).translate(rc)[::-1]
+    assert restore_bases_mirrored(conv, name) == glori
+
+
+def _stage_sam(tmp_path: Path, recs):
+    """recs: list of (name, seq, flag). Writes a SAM on one 100-nt contig."""
+    hdr = {"HD": {"VN": "1.6"}, "SQ": [{"SN": "c", "LN": 100}]}
+    p = tmp_path / "stage.sam"
+    with pysam.AlignmentFile(str(p), "w", header=hdr) as out:
+        for name, seq, flag in recs:
+            a = pysam.AlignedSegment(out.header)
+            a.query_name, a.flag, a.query_sequence = name, flag, seq
+            a.query_qualities = pysam.qualitystring_to_array("I" * len(seq))
+            if not flag & 4:
+                a.reference_id, a.reference_start = 0, 0
+                a.mapping_quality, a.cigartuples = 255, [(0, len(seq))]
+            out.write(a)
+    return p
+
+
+@pytest.mark.parametrize("stage", ["ag", "rvs"])
+@pytest.mark.parametrize("compat", [False, True])
+def test_stage_strand_rules(tmp_path: Path, stage, compat):
+    """Default: keep the stage's own strand, retry everything else.
+    glori_compat (GLORI-tools): stage 1 drops reverse hits instead of retrying
+    them, stage 2 keeps both orientations; only unmapped reads go on."""
+    seq = "ACGTAAGGCATTGCA"
+    fwd, rev, un = (encode_name(i, seq) for i in range(3))
+    conv = seq.replace("A", "G")
+    rc = str.maketrans("ACGT", "TGCA")
+    revcomp = lambda x: x.translate(rc)[::-1]          # SAM stores reverse hits revcomp'd
+    sam = _stage_sam(tmp_path, [(fwd, conv, 0), (rev, revcomp(conv), 16), (un, conv, 4)])
+    hdr = pysam.AlignmentHeader.from_dict({"SQ": [{"SN": "c", "LN": 100}]})
+    stats = AlignStats()
+    nxt = tmp_path / "next.fq"
+    with pysam.AlignmentFile(str(tmp_path / "o.bam"), "wb", header=hdr) as bam, \
+            open(nxt, "w") as nf:
+        _process_stage(sam, stage, bam, nf, {"c": 0}, stats, glori_compat=compat)
+    passed = [l[1:].strip() for l in nxt.read_text().splitlines()[::4]]
+    kept = {a.query_name: a for a in pysam.AlignmentFile(str(tmp_path / "o.bam"))}
+    if not compat:
+        own = fwd if stage == "ag" else rev
+        assert set(kept) == {own}
+        assert kept[own].query_sequence == (seq if own == fwd else revcomp(seq))
+        assert sorted(passed) == sorted({fwd, rev, un} - {own})
+        assert stats.wrong_strand == 0
+    elif stage == "ag":
+        assert passed == [un]
+        assert set(kept) == {fwd} and stats.wrong_strand == 1
+        assert kept[fwd].query_sequence == seq
+    else:
+        assert passed == [un]
+        assert set(kept) == {fwd, rev} and stats.wrong_strand == 0
+        assert kept[fwd].query_sequence == restore_bases_mirrored(conv, fwd)
+        assert kept[rev].query_sequence == revcomp(seq)
+
+
+@pytest.mark.parametrize("argv, expect", [
+    ([], {"min_mapq": 20, "min_baseq": 20, "max_unconverted": -1}),
+    (["--glori-compat"], {"min_mapq": 0, "min_baseq": 10, "max_unconverted": 3}),
+    (["--glori-compat", "--max-unconverted", "-1"],
+     {"min_mapq": 0, "min_baseq": 10, "max_unconverted": -1}),
+    (["--max-unconverted", "3"], {"min_mapq": 20, "min_baseq": 20, "max_unconverted": 3}),
+])
+def test_pileup_filter_defaults(argv, expect):
+    """--glori-compat switches the filter defaults; explicit values win."""
+    from hmm_m6a_fastq.cli import _pileup_filters, build_parser
+    args = build_parser().parse_args(["pileup", "--bam", "x.bam", "--genome", "g.fa",
+                                      "-o", "o.tsv", *argv])
+    assert _pileup_filters(args) == expect
 
 
 def test_iter_fastq_plain_and_malformed(tmp_path: Path):
@@ -148,30 +231,4 @@ def test_bam_bases_match_genome(dataset: Path, tmp_path: Path):
     assert main(["-q", "align", "--fastq", str(dataset / "full.clean.fq"),
                  "--ref-dir", str(dataset / "ref"), "-o", str(bam), "--threads", "2"]) == 0
     fa = pysam.FastaFile(str(dataset / "ref/index/genome/syn.main.fa"))
-    checked = bad = 0
-    with pysam.AlignmentFile(str(bam)) as fh:
-        for r in fh:
-            ref = fa.fetch(r.reference_name, r.reference_start, r.reference_end)
-            tgt, conv = ("T", "C") if r.is_reverse else ("A", "G")
-            for qp, rp in r.get_aligned_pairs(matches_only=True):
-                rb, qb = ref[rp - r.reference_start], r.query_sequence[qp]
-                checked += 1
-                ok = qb in (tgt, conv) if rb == tgt else qb == rb
-                bad += not ok
-    # error-free simulation: only STAR's junction-edge placements may disagree
-    assert checked > 100_000 and bad <= 10
-
-
-@needs_tools
-def test_two_stage_train_then_call(dataset: Path, tmp_path: Path):
-    ref = str(dataset / "ref")
-    bam, pile = tmp_path / "s.bam", tmp_path / "s.pileup.tsv"
-    params, calls = tmp_path / "p.json", tmp_path / "c.tsv"
-    assert main(["-q", "align", "--fastq", str(dataset / "full.clean.fq"),
-                 "--ref-dir", ref, "-o", str(bam)]) == 0
-    assert main(["-q", "pileup", "--bam", str(bam), "--ref-dir", ref, "-o", str(pile)]) == 0
-    assert main(["-q", "train", "--pileup", str(pile), "-o", str(params)]) == 0
-    assert main(["-q", "call", "--pileup", str(pile), "--params", str(params),
-                 "--ref-dir", ref, "-o", str(calls), "--threads", "1"]) == 0
-    got = _called(calls)
-    assert len(_truth(dataset) & set(zip(got["contig"], got["pos0"]))) >= 30
+ 

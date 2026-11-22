@@ -15,8 +15,12 @@ read is changed to G in silico, then:
 
 Unique hits only (STAR --outFilterMultimapNmax 1, bowtie -m 1). A read that
 is not kept at one stage (unmapped, too many loci, or wrong strand) is tried
-at the next. Kept reads get their ORIGINAL bases back so the pileup sees
-real A (retained) vs G (converted) calls, and contig names lose the
+at the next. With `AlignOptions.glori_compat` the strand rules and base
+restoration are GLORI-tools' instead (see `_process_stage`), so the BAM holds
+exactly the reads GLORI-tools keeps.
+
+Kept reads get their ORIGINAL bases back so the pileup sees real A
+(retained) vs G (converted) calls, and contig names lose the
 "_AG_converted" suffix so they match hg38.main.fa.
 
 Restoring bases needs no lookup table: each converted read is renamed
@@ -182,6 +186,27 @@ def restore_bases(conv_read: str, name: str) -> str:
     return "".join(s)
 
 
+def restore_bases_mirrored(conv_read: str, name: str) -> str:
+    """GLORI-tools' restoration of a stage-2 (rvsCom) forward-strand hit.
+
+    mapping_reads.py reverseReads2 assumes every rvsCom hit is reverse: it
+    reverse-complements the stored sequence, writes A at the read's original
+    A positions and reverse-complements back. For a forward hit this puts T at
+    the mirrored positions (len - 1 - k) instead of A at k. Reproduced as is so
+    that both pipelines count the same bases.
+    """
+    mask = int(name.rsplit("_", 1)[1], 16)
+    s = list(conv_read)
+    L = len(s)
+    k = 0
+    while mask:
+        if mask & 1:
+            s[L - 1 - k] = "T"
+        mask >>= 1
+        k += 1
+    return "".join(s)
+
+
 def _write_fq(fh: IO[str], name: str, seq: str, qual: str) -> None:
     fh.write(f"@{name}\n{seq}\n+\n{qual}\n")
 
@@ -196,6 +221,7 @@ class AlignOptions:
     min_frac: float = 0.5        # STAR --outFilterScoreMinOverLread / MatchNminOverLread
     star_extra: Sequence[str] = ()
     bowtie_extra: Sequence[str] = ()
+    glori_compat: bool = False   # GLORI-tools strand rules and base restoration
 
 
 def _run_star(fq: Path, star_dir: str, prefix: Path, opt: AlignOptions) -> Path:
@@ -279,9 +305,11 @@ def _emit(
 class AlignStats:
     reads_in: int = 0
     genome_plus: int = 0          # stage 1, + strand genes
-    genome_minus: int = 0         # stage 2, - strand genes
+    genome_minus: int = 0         # stage 2, - strand genes (glori_compat: plus
+                                  # GLORI-tools' rare forward hits)
     transcriptome: int = 0        # stage 3, lifted to genome
-    unaligned: int = 0            # no unique, correctly oriented hit anywhere
+    wrong_strand: int = 0         # glori_compat only: stage 1/3 reverse hits dropped
+    unaligned: int = 0            # no unique, accepted hit at any stage
     unlifted: int = 0             # stage-3 hits that could not be lifted
     off_genome: int = 0           # transcriptome hits on chroms missing from the main genome
     stage_logs: Dict[str, str] = field(default_factory=dict)
@@ -299,9 +327,22 @@ def _process_stage(
     tids: Dict[str, int],
     stats: AlignStats,
     tx_models: Optional[Dict[str, TranscriptModel]] = None,
+    glori_compat: bool = False,
 ) -> None:
-    """Keep this stage's accepted reads (restored) and pass the rest on."""
-    want_reverse = stage == "rvs"
+    """Keep this stage's accepted reads (restored) and pass the rest on.
+
+    Default: keep forward hits in ag and tx and reverse hits in rvs; every
+    other read (unmapped or wrong strand) is retried at the next stage.
+
+    glori_compat reproduces GLORI-tools' mapping_reads.py instead:
+      ag  (STAR, A->G genome)  keep forward hits (samtools -F 20); reverse
+                               hits are dropped, NOT retried, because only
+                               STAR's unmapped reads go on to stage 2.
+      rvs (STAR, T->C genome)  keep hits in either orientation (-F 4 -q 255);
+                               forward hits get GLORI-tools' mirrored base
+                               restoration (`restore_bases_mirrored`).
+      tx  (bowtie)             keep forward hits (-F 20).
+    """
     with pysam.AlignmentFile(str(in_path), "r", check_sq=False) as fh:
         for rec in fh:
             if rec.is_secondary or rec.is_supplementary:
@@ -309,8 +350,19 @@ def _process_stage(
             seq, qual = _read_orient(rec)
             name = rec.query_name
             kept = False
-            if not rec.is_unmapped and rec.is_reverse == want_reverse:
-                read_seq = restore_bases(seq, name)
+            mapped = not rec.is_unmapped
+            if glori_compat:
+                if mapped and rec.is_reverse and stage in ("ag", "tx"):
+                    stats.wrong_strand += 1
+                    continue
+                accept = mapped
+            else:
+                accept = mapped and rec.is_reverse == (stage == "rvs")
+            if accept:
+                if glori_compat and stage == "rvs" and not rec.is_reverse:
+                    read_seq = restore_bases_mirrored(seq, name)
+                else:
+                    read_seq = restore_bases(seq, name)
                 ref = rec.reference_name
                 base_ref = ref[: -len(TX_SUFFIX)] if ref.endswith(TX_SUFFIX) else ref
                 tags = [(t, v) for t, v in rec.get_tags() if t in _KEEP_TAGS]
@@ -391,7 +443,7 @@ def align_fastq(
             s1 = _run_star(conv_fq, refs.star_dir(refs.genome_ag), work / "ag.", opt)
             fq2 = work / "stage2.fq"
             with open(fq2, "w") as nf:
-                _process_stage(s1, "ag", bam, nf, tids, stats)
+                _process_stage(s1, "ag", bam, nf, tids, stats, glori_compat=opt.glori_compat)
             s1.unlink()
             say(f"  kept {stats.genome_plus}")
 
@@ -399,18 +451,19 @@ def align_fastq(
             s2 = _run_star(fq2, refs.star_dir(refs.genome_rvs), work / "rvs.", opt)
             fq3 = work / "stage3.fq"
             with open(fq3, "w") as nf:
-                _process_stage(s2, "rvs", bam, nf, tids, stats)
+                _process_stage(s2, "rvs", bam, nf, tids, stats, glori_compat=opt.glori_compat)
             s2.unlink()
             say(f"  kept {stats.genome_minus}")
 
             say("stage 3: bowtie -> transcriptome (lifted to genome via tbl2)")
             models = load_tbl2(refs.anno)
             s3 = _run_bowtie(fq3, refs.transcriptome, work / "tx.sam", opt)
-            _process_stage(s3, "tx", bam, None, tids, stats, tx_models=models)
+            _process_stage(s3, "tx", bam, None, tids, stats, tx_models=models,
+                           glori_compat=opt.glori_compat)
             s3.unlink()
             say(f"  kept {stats.transcriptome} (unliftable {stats.unlifted})")
 
-        stats.unaligned = (stats.reads_in - stats.aligned
+        stats.unaligned = (stats.reads_in - stats.aligned - stats.wrong_strand
                            - stats.unlifted - stats.off_genome)
         for tag, src in (("STAR_AG", work / "ag.Log.final.out"),
                          ("STAR_rvsCom", work / "rvs.Log.final.out"),
@@ -430,9 +483,11 @@ def align_fastq(
             shutil.rmtree(work, ignore_errors=True)
 
     Path(f"{out_bam}.stats.json").write_text(
-        json.dumps({**asdict(stats), "aligned": stats.aligned}, indent=2))
+        json.dumps({**asdict(stats), "aligned": stats.aligned,
+                    "glori_compat": opt.glori_compat}, indent=2))
     n = max(stats.reads_in, 1)
     say(f"kept {stats.aligned}/{stats.reads_in} ({100 * stats.aligned / n:.1f}%): "
         f"+genome {stats.genome_plus}, -genome {stats.genome_minus}, "
-        f"transcriptome {stats.transcriptome}; unaligned {stats.unaligned}")
+        f"transcriptome {stats.transcriptome}; wrong strand {stats.wrong_strand}, "
+        f"unaligned {stats.unaligned}")
     return stats

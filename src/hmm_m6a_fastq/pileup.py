@@ -14,7 +14,9 @@ count:
     n_t = A_t + G_t                       (informative coverage)
 
 Reads whose aligned base is C, T, an indel, or a skip are not counted.
-This matches the convention in the original GLORI calling pipeline.
+With `glori_compat=True` (and GLORI-tools' filter values, as set by the CLI's
+--glori-compat), A_t and n_t are exactly the A and A+G counts GLORI-tools'
+binomial caller tests at its default `--cutoff 3`.
 
 We also compute the DRACH-motif flag from the *reference* 5-mer centred on
 each adenosine, using the standard:
@@ -146,9 +148,11 @@ def _poorly_converted_reads(
     """Keys of reads overlapping `region` that carry more than `max_unconverted`
     unconverted transcript-strand adenosines anywhere along the read.
 
-    This is the GLORI-style read filter: GLORI's own caller discards reads with
-    several unconverted A's, because such molecules largely escaped the
-    chemistry (they are not informative about methylation at any one site).
+    Default read filter: only aligned positions where the reference is A and
+    the base passes `min_baseq` are counted, so soft clips, mismatches and
+    low-quality bases do not count. Such molecules largely escaped the
+    chemistry and say nothing about methylation at any one site. The
+    GLORI-tools variant (whole-read count) is `read_a_count`.
     """
     lo = max(0, region.start - margin)
     hi = region.end + margin
@@ -182,6 +186,28 @@ def _poorly_converted_reads(
     return bad
 
 
+def read_a_count(aln: pysam.AlignedSegment) -> int:
+    """Number of A's in the read, in RNA-sense orientation.
+
+    Used with `glori_compat`. Same count as GLORI-tools'
+    pileup_genome_multiprocessing.py: the whole stored sequence (soft clips,
+    mismatches and low-quality bases included), counting 'T' for
+    reverse-strand alignments.
+    """
+    q = aln.query_sequence or ""
+    return q.count("T") if aln.is_reverse else q.count("A")
+
+
+# With glori_compat: GLORI-tools get_referbase.py only keeps a strand-position
+# seen by >= 2 reads (any base, after the base-quality filter, before the
+# A-count read filter).
+GLORI_MIN_COLUMN_READS = 2
+# Depth cap, as in GLORI-tools (-m / -M of pileup_genome_multiprocessing.py).
+# Always on: pysam's default (8000) would silently truncate deep columns.
+MAX_DEPTH = 10_000_000
+MAX_DEPTH_GL = 10_000      # contigs whose name contains "GL"
+
+
 # ---------------------------------------------------------------------------
 # Per-region pileup
 # ---------------------------------------------------------------------------
@@ -193,6 +219,7 @@ def _pileup_region(
     min_baseq: int,
     library: str = "unstranded",
     max_unconverted: int = -1,
+    glori_compat: bool = False,
 ) -> TranscriptObs:
     """Build a TranscriptObs for one region by walking pysam's pileup."""
 
@@ -219,20 +246,21 @@ def _pileup_region(
     bad_reads = (
         _poorly_converted_reads(bam, fasta, region, min_mapq, min_baseq, library,
                                 max_unconverted)
-        if max_unconverted >= 0 else set()
+        if max_unconverted >= 0 and not glori_compat else set()
     )
+    min_column_reads = GLORI_MIN_COLUMN_READS if glori_compat else 1
 
-    # We use truncate=True so pileup only emits columns inside [start, end).
-    # min_base_quality / min_mapping_quality are passed to pysam directly.
-    # Note: pysam returns reference positions in 0-based genomic coordinates,
-    # so we map them back to a 0-based offset inside the region.
+    # Base quality is checked per read below (pysam's own filter is off, as in
+    # GLORI-tools); truncate=True keeps columns inside [start, end). pysam
+    # positions are 0-based genomic coordinates.
     for col in bam.pileup(
         contig=region.contig,
         start=region.start,
         stop=region.end,
         truncate=True,
-        min_base_quality=min_baseq,
+        min_base_quality=0,
         min_mapping_quality=min_mapq,
+        max_depth=MAX_DEPTH_GL if "GL" in region.contig else MAX_DEPTH,
         ignore_orphans=False,
         ignore_overlaps=False,
     ):
@@ -250,17 +278,25 @@ def _pileup_region(
 
         n_A = 0
         n_G = 0
+        n_reads = 0
         for read in col.pileups:
-            if read.is_del or read.is_refskip:
-                continue
-            if not _read_on_strand(read.alignment, region.strand, library):
-                continue
-            if bad_reads and _read_key(read.alignment) in bad_reads:
-                continue
             qpos = read.query_position
-            if qpos is None:
+            if qpos is None:          # deletion or intron skip
                 continue
-            base = read.alignment.query_sequence[qpos].upper()
+            aln = read.alignment
+            if not _read_on_strand(aln, region.strand, library):
+                continue
+            quals = aln.query_qualities
+            if quals is not None and quals[qpos] < min_baseq:
+                continue
+            n_reads += 1
+            if max_unconverted >= 0:
+                if glori_compat:
+                    if read_a_count(aln) > max_unconverted:
+                        continue
+                elif _read_key(aln) in bad_reads:
+                    continue
+            base = aln.query_sequence[qpos].upper()
             # If we're on the minus strand, the read base must be
             # complemented to compare against the transcript-strand sequence.
             if region.strand == "-":
@@ -271,6 +307,8 @@ def _pileup_region(
                 n_G += 1
             # bases C, T (or N, indels) are uninformative under GLORI
 
+        if n_reads < min_column_reads:
+            continue
         A_count[i] = n_A
         G_count[i] = n_G
 
@@ -330,6 +368,7 @@ def pileup_bam(
     show_progress: bool = True,
     library: str = "unstranded",
     max_unconverted: int = -1,
+    glori_compat: bool = False,
 ) -> List[Tuple[Region, TranscriptObs]]:
     """Pile up per-adenosine A/G counts and compute DRACH context.
 
@@ -345,8 +384,14 @@ def pileup_bam(
         library: read orientation of a stranded library ("single-forward" for
             GLORI A-less sense reads, "single-reverse", "R1-sense",
             "R1-antisense") or "unstranded" (keep reads from both strands).
-        max_unconverted: GLORI-style read filter; drop reads with more than
-            this many unconverted transcript adenosines (-1 = keep all reads).
+        max_unconverted: drop reads with more than this many unconverted A's
+            (-1 = keep all reads). How A's are counted depends on
+            `glori_compat`.
+        glori_compat: reproduce GLORI-tools' counts: the read filter counts
+            every A in the whole read (`read_a_count`) and a strand-position
+            seen by fewer than 2 reads gets n = 0. Pass min_mapq=0,
+            min_baseq=10, max_unconverted=3 as well for GLORI-tools' values
+            (the CLI's --glori-compat does this).
 
     Returns:
         list of (Region, TranscriptObs) in the same order as `regions`.
@@ -367,7 +412,8 @@ def pileup_bam(
             continue
         try:
             tr = _pileup_region(bam, fasta, r, min_mapq=min_mapq, min_baseq=min_baseq,
-                                library=library, max_unconverted=max_unconverted)
+                                library=library, max_unconverted=max_unconverted,
+                                glori_compat=glori_compat)
         except (ValueError, KeyError):
             # Contig present in FASTA but absent from BAM index, etc.
             continue
