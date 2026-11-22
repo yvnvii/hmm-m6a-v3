@@ -39,8 +39,7 @@ is found by its suffix. Any file can also be given explicitly
 (`--genome`, `--genome-ag`, `--genome-rvs`, `--transcriptome`, `--anno`,
 `--baseanno`), which overrides the lookup.
 
-No regions BED is needed: HMM chains are built from read coverage (see
-step 3). You can still pass `--bed` to restrict scoring.
+HMM chains are built from read coverage (see step 3). You can still pass a BED file with `--bed` to restrict scoring.
 
 ## Installation
 
